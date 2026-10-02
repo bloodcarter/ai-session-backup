@@ -1,78 +1,132 @@
 # ai-session-backup
 
-Backs up every Claude and Codex session on this Mac, plus the artifacts in the Claude account, every
-8 hours. Copies go to `~/Backups/ai-sessions` and then to `iCloud Drive/AI session backup`. The tool
-never deletes anything in either place.
+Keeps every Claude Code and Codex session log on your Mac, and every artifact in your claude.ai
+account, in a local backup folder and in iCloud Drive. It runs in the background every 8 hours and
+never deletes anything it has saved.
+
+## Why this exists
+
+Your sessions with coding agents record how the work got done: the reasoning, the research, the dead
+ends and the commands that worked. That record is easier to lose than it looks:
+
+- **Claude Code deletes session logs after 30 days of inactivity** by default (the
+  `cleanupPeriodDays` setting). Recent versions spare sessions started from the Claude desktop app;
+  earlier versions deleted those too, and the rule can change again.
+- **Deleting a session in the Claude desktop app deletes its log at once.**
+- **Artifacts live only in your claude.ai account.** If you lose access to the account, they are gone.
+- **Codex keeps its sessions, but in one folder on one disk,** with no second copy.
+
+ai-session-backup copies all of it into `~/Backups/ai-sessions` every 8 hours, keeps every version it
+has seen, and copies that folder into iCloud Drive.
 
 ## What it backs up
 
-- **Claude Code sessions** from `~/.claude/projects` (terminal and desktop app, with subagents), plus
-  prompt history, file snapshots, the 2025 session database, desktop-app session metadata, Cowork
-  sessions and any Claude folders it finds in Cursor worktrees.
+- **Claude Code sessions** from `~/.claude/projects` (terminal and desktop app, with subagents), your
+  prompt history, file snapshots, sessions in Claude Code's older 2025 database, desktop-app session
+  metadata, Cowork sessions, and Claude folders it finds in Cursor worktrees.
 - **Codex sessions**, active and archived, with thread names, memories, attachments and a snapshot of
-  the thread database (one more copy kept per month).
-- **Claude artifacts**: each artifact's own published files and uploaded assets. Docs artifacts also
-  get each tab's text as Markdown and HTML. A new dated snapshot is written only when an artifact
-  changes; unchanged files are hard links to the previous snapshot.
+  the thread database (plus one copy kept per month).
+- **Claude artifacts**: each artifact's own published files and uploaded images. Docs artifacts also
+  get every tab's text as Markdown and HTML.
+
+It does not cover anything that never reaches your disk: claude.ai chats, cloud Claude Code
+sessions, and the chat, memory and files of Claude Code projects.
 
 ## How it works
 
-1. **Sessions.** Files are copied as APFS clones, so unchanged data costs no disk space. A session
-   log that is rewritten instead of appended keeps its old copy in `_replaced/<date>/`.
-   Databases are copied with SQLite's backup API, or cloned whole when the owning app has closed them.
-2. **Artifacts.** Short headless Claude Code runs (Haiku) call the Artifact tool and the Claude Docs
-   connector. Each run can only read: publishing and deleting are blocked, and all other tools are
-   refused. Every download is checked against the SHA-256 the tool reports.
-3. **iCloud.** New and changed files are cloned into iCloud Drive. Each run asks iCloud which files
-   it has uploaded and raises a notification for any file still not uploaded 3 days after copying.
+1. **Sessions.** Files are copied as APFS clones, so unchanged data takes no extra disk space. Files
+   deleted at the source stay in the backup. A session log that is rewritten instead of appended
+   keeps its old copy in `_replaced/<date>/`. Databases are copied with SQLite's backup API, or cloned
+   whole when the app that owns them has closed them.
+2. **Artifacts.** Short headless Claude Code runs on Haiku call the Artifact tool and the Claude Docs
+   connector. Those runs can only read: publishing and deleting are blocked, and every other tool is
+   refused. Downloaded files and images are checked against the SHA-256 the tool reports. An artifact gets a new
+   dated snapshot only when it changes, and files that did not change are hard links to the
+   previous snapshot.
+3. **iCloud.** New and changed files are cloned into `iCloud Drive/AI session backup`. Each run asks
+   iCloud which files it has uploaded, and notifies you about any file still not uploaded 3 days
+   after it was copied.
 
-Any failure raises a macOS notification. `state.json` records the last run, and `logs/` holds
-the details.
+Any failure shows a macOS notification. `~/Backups/ai-sessions/state.json` records the last run, and
+`~/Backups/ai-sessions/logs/` holds the details.
+
+## Before you install
+
+- **Unofficial.** This project is not affiliated with Anthropic or OpenAI.
+- **The artifact step relies on undocumented Claude Code behavior.** Claude Code offers its Artifact
+  tool only when it runs as the Claude desktop app's engine, so the headless runs set
+  `CLAUDE_CODE_ENTRYPOINT=claude-desktop`. The step also reads the text the tool returns. A Claude Code
+  update can break either; the artifact step then fails with a notification, and the session backup
+  and iCloud copy keep working.
+- **The artifact step uses your own Claude usage**: a few short Haiku runs per artifact that changed,
+  plus a re-export of each Docs artifact on every run.
+- **Backups hold everything your sessions saw**, including any secret that appeared in a command's
+  output. If you keep the iCloud copy, turn on Advanced Data Protection (System Settings, your Apple
+  Account, iCloud) so Apple cannot read it.
+- **Provided as is.** I use it daily and fix what breaks for me, but I promise no support.
 
 ## Requirements
 
-- macOS on APFS, with `/usr/bin/python3` (Xcode Command Line Tools). Standard library only.
-- Claude Code in Terminal, logged in once with `claude auth login` (artifacts step only).
-- iCloud Drive turned on (iCloud step only).
+- macOS on APFS, with the Xcode Command Line Tools (for `/usr/bin/python3`). Standard library only.
+- For artifacts: Claude Code in Terminal, logged in once with `claude auth login`.
+- For the iCloud copy: iCloud Drive turned on, with room for your sessions.
 
 ## Install
 
 ```bash
-mkdir -p ~/Backups/ai-sessions/bin
-ln -sf ~/repos/ai-session-backup/ai_session_backup.py ~/Backups/ai-sessions/bin/ai_session_backup.py
-cp ~/repos/ai-session-backup/com.vlad.ai-session-backup.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vlad.ai-session-backup.plist
+git clone https://github.com/bloodcarter/ai-session-backup ~/repos/ai-session-backup
+~/repos/ai-session-backup/install.sh
 ```
 
-The plist is copied rather than linked because launchd may refuse a symlinked job file. After
-editing it, copy it again and reload the job with `launchctl bootout` followed by `launchctl bootstrap`.
+Leave steps out with `--skip artifacts`, `--skip icloud` or `--skip artifacts,icloud`. To see the
+launchd job file before installing it, run `install.sh --print-plist`.
+
+The installer links `~/Backups/ai-sessions/bin/ai_session_backup.py` to your clone, so a `git pull`
+takes effect on the next run.
+
+Also tell Claude Code to keep its own logs longer, by adding this to `~/.claude/settings.json`:
+
+```json
+"cleanupPeriodDays": 3650
+```
 
 ## Use
 
 ```bash
-launchctl kickstart gui/$(id -u)/com.vlad.ai-session-backup   # run now
-launchctl print gui/$(id -u)/com.vlad.ai-session-backup       # schedule, run count, last exit code
-python3 ai_session_backup.py --only sessions                  # or: artifacts, icloud
+launchctl kickstart gui/$(id -u)/com.$USER.ai-session-backup   # run now
+launchctl print gui/$(id -u)/com.$USER.ai-session-backup       # schedule, runs, last exit code
+python3 ai_session_backup.py --only sessions                   # one step by hand: sessions, artifacts or icloud
 ```
+
+## Where things go
+
+| In `~/Backups/ai-sessions/` | What it holds |
+|---|---|
+| `claude/` | Claude Code, desktop app and Cowork sessions, history and file snapshots |
+| `codex/` | Codex sessions, thread index, memories, attachments and database snapshots |
+| `claude-artifacts/<artifact id>/<date>/` | one snapshot per day an artifact changed (`<date>.2` for a second change that day) |
+| `_replaced/<date>/` | old copies of session logs that were rewritten |
+| `state.json`, `logs/` | last run result and details |
+
+Every session is a plain `.jsonl` file you can open, search or copy back to its original folder.
 
 ## Things that can change under it
 
-- Claude Code offers the Artifact tool only when it runs as the desktop app's engine, and the
-  `enableArtifact` setting cannot turn it on. The headless runs therefore set
-  `CLAUDE_CODE_ENTRYPOINT=claude-desktop`. A future Claude Code release may change this; the
-  artifacts step would then fail with a notification.
-- The artifact list dates changes by day in UTC. The tool records its own checks in UTC and
-  re-checks anything listed within a day of the last check.
-- The Claude Docs connector is sometimes not yet connected when a headless run starts. Docs exports
+- The artifact list dates changes by day in UTC. The tool records its checks in UTC and checks
+  anything listed within a day of its last check again.
+- The Claude Docs connector is sometimes not connected yet when a headless run starts. Docs exports
   retry three times, and a Docs artifact is never saved without its text.
-- Claude Code saves a large tool result to a file and returns a stub. The tool reads the file, then
-  removes the run folders its headless runs leave in `~/.claude/projects`.
+- Claude Code saves a large tool result to a file and returns a stub instead. The tool reads that file,
+  then removes the folders its headless runs leave in `~/.claude/projects`.
 
 ## Uninstall
 
 ```bash
-launchctl bootout gui/$(id -u)/com.vlad.ai-session-backup
-rm ~/Library/LaunchAgents/com.vlad.ai-session-backup.plist
+~/repos/ai-session-backup/install.sh --uninstall
 ```
 
-The backups in `~/Backups/ai-sessions` and iCloud Drive stay where they are.
+Your backups in `~/Backups/ai-sessions` and in iCloud Drive stay where they are.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

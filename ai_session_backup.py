@@ -11,8 +11,8 @@ Artifacts are fetched through Claude Code's own Artifact tool in a locked-down h
 (Haiku, no shell, no file tools, nothing saved to session history). That step needs the terminal
 Claude Code to be logged in (`claude auth login`); without a login it is skipped and you get a notification.
 
-Usage: ai_session_backup.py [--only sessions|artifacts|icloud]
-Runs every 8 hours (03:30, 11:30, 19:30) from ~/Library/LaunchAgents/com.vlad.ai-session-backup.plist.
+Usage: ai_session_backup.py [--only sessions|artifacts|icloud] [--skip artifacts,icloud]
+install.sh schedules it with launchd every 8 hours (03:30, 11:30, 19:30).
 """
 import argparse
 import base64
@@ -726,8 +726,14 @@ def mirror_to_icloud():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--only", choices=["sessions", "artifacts", "icloud"])
+    steps = ["sessions", "artifacts", "icloud"]
+    ap.add_argument("--only", choices=steps)
+    ap.add_argument("--skip", default="", help="comma-separated steps to leave out, e.g. artifacts,icloud")
     args = ap.parse_args()
+    skip = {x.strip() for x in args.skip.split(",") if x.strip()}
+    if skip - set(steps):
+        ap.error("--skip: unknown step %s (choose from %s)" % (", ".join(sorted(skip - set(steps))), ", ".join(steps)))
+    run = lambda step: args.only in (None, step) and step not in skip
     ROOT.mkdir(parents=True, exist_ok=True)
     lock = open(ROOT / ".lock", "w")
     try:
@@ -744,7 +750,7 @@ def main():
         notify("Backup stopped: less than 10 GB free on the disk.")
         return 1
     ok = True
-    if args.only in (None, "sessions"):
+    if run("sessions"):
         try:
             s = backup_sessions()
         except Exception as e:  # never die silently: record it and notify
@@ -754,7 +760,7 @@ def main():
         log("sessions: %(copied)d new, %(updated)d updated, %(unchanged)d unchanged, "
             "%(preserved)d old versions kept, %(errors)d errors" % s)
         ok = ok and s["errors"] == 0
-    if args.only in (None, "artifacts"):
+    if run("artifacts"):
         try:
             a, status = backup_artifacts()
         except Exception as e:
@@ -762,7 +768,7 @@ def main():
         state["artifacts"] = dict(a, status=status)
         log("artifacts: %s %s" % (status, json.dumps(a)))
         ok = ok and a.get("errors", 0) == 0 and not status.startswith("failed")
-    if args.only in (None, "icloud"):
+    if run("icloud"):
         try:
             i = mirror_to_icloud()
         except Exception as e:
