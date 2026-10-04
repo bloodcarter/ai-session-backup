@@ -116,6 +116,12 @@ Every session is a plain `.jsonl` file you can open, search or copy back to its 
   anything listed within a day of its last check again.
 - The Claude Docs connector is sometimes not connected yet when a headless run starts. Docs exports
   retry three times, and a Docs artifact is never saved without its text.
+- Artifacts shared with you from another account (for example after you switch Claude accounts) do not
+  appear in your artifact list, though their links still work. The tool therefore also checks every
+  artifact it has already saved, by its link. If one stops opening, or the Claude Docs connector refuses
+  a Docs artifact's text, you get one notification, its last snapshot is kept, and it is retried daily.
+- Uploaded assets are listed 50 per page and downloaded one at a time. The tool reads every page and
+  downloads only assets it does not already have, matched by checksum.
 - Claude Code saves a large tool result to a file and returns a stub instead. The tool reads that file,
   then removes the folders its headless runs leave in `~/.claude/projects`.
 

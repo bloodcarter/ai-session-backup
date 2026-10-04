@@ -265,9 +265,11 @@ def backup_sessions():
 
 LIST_RE = re.compile(r"^- \((?P<owner>[^)]+)\) (?P<title>.+?) — (?P<url>https://claude\.ai/(?:code/)?artifact/"
                      r"(?P<id>[A-Za-z0-9_-]+)) — updated (?P<updated>\d{4}-\d{2}-\d{2})\s*$", re.M)
+LIST_HEADER_RE = re.compile(r"^\s*(?:(\d+) artifacts?,|No artifacts)", re.M)
 FILE_LINE_RE = re.compile(r'^- "(?P<path>.+?)"\s+\S+\s+\d+ bytes\s*$', re.M)
 TYPE_RE = re.compile(r'an Artifact of type "([^"]+)"')
-ASSET_LINE_RE = re.compile(r"^- /_blob/(?P<id>[0-9a-f]{32})\s", re.M)
+ASSET_LINE_RE = re.compile(r"^- /_blob/(?P<id>[0-9a-f]{32})\s.*?sha256 (?P<sha>[0-9a-f]{64})", re.M)
+NEXT_PAGE_RE = re.compile(r'pass after: "([^"]+)"')
 SAVED_DIR_RE = re.compile(r'Files saved under "(?P<dir>[^"]+)" from version (?P<version>\S+) of')
 SAVED_FILE_RE = re.compile(r'^- "(?P<path>.+?)" saved \((?P<size>\d+) bytes, "[^"]*", sha256 (?P<sha>[0-9a-f]{64})\)', re.M)
 CONTENT_RE = re.compile(r"<artifact-file-content>.*?</artifact-file-content>", re.S)
@@ -290,7 +292,9 @@ def parse_type(text):
 
 
 def parse_assets_listing(text):
-    return [m.group("id") for m in ASSET_LINE_RE.finditer(text)]
+    """(id, sha256) of each asset on one listing page, and the cursor of the next page if there is one."""
+    nxt = NEXT_PAGE_RE.search(text)
+    return [(m.group("id"), m.group("sha")) for m in ASSET_LINE_RE.finditer(text)], (nxt.group(1) if nxt else None)
 
 
 def parse_read_result(text):
@@ -427,9 +431,19 @@ def link_tree(src, dst):
             os.link(s, d)
 
 
+class DocsAccessDenied(RuntimeError):
+    """The Claude Docs connector refuses this account access to a doc's text."""
+
+
+ASSET_BATCH = 40  # asset downloads per headless run (assets can only be read one at a time)
 DOCS_TOOLS = ("mcp__claude_ai_Claude_Docs__read", "mcp__claude_ai_Claude_Docs__export")  # claude.ai Docs connector
 DOCS_ATTEMPTS = 3
 DOCS_RETRY_SECONDS = 30  # the Claude Docs connector sometimes is not connected yet when a run starts
+
+
+def docs_refused(results):
+    """Whether Claude Docs refused the account (no access, or a role that may not do this); retrying will not help."""
+    return any('"verdict":"deny"' in t and ('"reason":"access"' in t or '"reason":"forbidden"' in t) for t in results)
 
 
 def export_docs_once(claude, work, aid, docs_tools, stage):
@@ -437,6 +451,8 @@ def export_docs_once(claude, work, aid, docs_tools, stage):
     res, _ = run_claude(claude, 'Call the tool named %s exactly once with {"ref": {"object": "project", '
                         '"id": "%s"}}. Do not call any other tool. Then reply with the word DONE.'
                         % (read_tool, aid), 4, work, allow=[read_tool])
+    if docs_refused(res):
+        raise DocsAccessDenied("Claude Docs refuses this account access to the doc's text")
     tabs = parse_doc_tabs(next((t for t in res if '"files"' in t), ""))
     if not tabs:
         raise RuntimeError("Docs artifact: no tabs found in %r" % [t[:200] for t in res])
@@ -447,6 +463,8 @@ def export_docs_once(claude, work, aid, docs_tools, stage):
         res, _ = run_claude(claude, "Make exactly these tool calls, in this order, and nothing else:\n"
                             + "\n".join("%d) %s" % (n + 1, c) for n, c in enumerate(calls))
                             + "\nThen reply with the word DONE.", 5, work, allow=[export_tool])
+        if docs_refused(res):
+            raise DocsAccessDenied("Claude Docs refuses this account an export of the doc's text")
         exports = {e["format"]: e for e in (parse_doc_export(t) for t in res) if e}
         if "markdown" not in exports:
             raise RuntimeError("Docs tab %s: Markdown export failed: %r" % (tab_id, [t[:200] for t in res]))
@@ -468,11 +486,27 @@ def export_docs(claude, work, aid, docs_tools, stage):
     for attempt in range(1, DOCS_ATTEMPTS + 1):
         try:
             return export_docs_once(claude, work, aid, docs_tools, stage)
+        except DocsAccessDenied:
+            raise  # retrying will not change it
         except RuntimeError:
             if attempt == DOCS_ATTEMPTS:
                 raise
             shutil.rmtree(stage / "docs", ignore_errors=True)
             time.sleep(DOCS_RETRY_SECONDS)
+
+
+def list_all_assets(claude, work, url, first_page):
+    """All of an artifact's uploaded assets as (id, sha256). The tool lists them 50 per page."""
+    assets, cursor = parse_assets_listing(first_page)
+    while cursor:
+        res, _ = run_claude(claude, 'Call the Artifact tool exactly once with {"action": "list", "scope": "assets", '
+                            '"url": "%s", "after": "%s"}. Do not call any other tool. Then reply with the word DONE.'
+                            % (url, cursor), 4, work)
+        page, cursor = parse_assets_listing(next((t for t in res if "Assets of https" in t), ""))
+        if not page:
+            raise RuntimeError("an asset listing page came back empty after %d assets" % len(assets))
+        assets += page
+    return assets
 
 
 def save_artifact(claude, work, base, it, index, docs_tools):
@@ -489,7 +523,11 @@ def save_artifact(claude, work, base, it, index, docs_tools):
         raise RuntimeError("no version in the files listing: %r" % (res[:1],))
     atype = parse_type(listing)
     paths = [p for p in paths if not p.startswith("artifact-type/")]
-    assets = parse_assets_listing(next((t for t in res if "Assets of https" in t), ""))
+    assets = list_all_assets(claude, work, url, next((t for t in res if "Assets of https" in t), ""))
+    old = json.loads((prev_dir / "meta.json").read_text()) if prev_dir and (prev_dir / "meta.json").is_file() else {}
+    old_assets = {a["name"].split(".")[0]: a for a in old.get("assets", [])}
+    same_version = version == prev.get("version") and bool(old)
+    same_assets = sorted(assets) == sorted((i, a["sha256"]) for i, a in old_assets.items())
 
     stage = base / aid / (".staging-%d" % os.getpid())
     if stage.exists():
@@ -499,22 +537,17 @@ def save_artifact(claude, work, base, it, index, docs_tools):
         meta = {"title": it["title"], "url": url, "owner": it["owner"], "type": atype, "version": version,
                 "listed_updated": it["updated"], "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "files": [], "assets": [], "docs": []}
-        if version == prev.get("version") and prev_dir and prev_dir.is_dir():
-            for part in ("files", "assets"):
-                if (prev_dir / part).is_dir():
-                    link_tree(prev_dir / part, stage / part)
-            old = json.loads((prev_dir / "meta.json").read_text())
-            meta["files"], meta["assets"] = old.get("files", []), old.get("assets", [])
-        else:
+        if same_version:  # published files unchanged: reuse the previous copies
+            if (prev_dir / "files").is_dir():
+                link_tree(prev_dir / "files", stage / "files")
+            meta["files"] = old.get("files", [])
+        elif paths:
             calls = ['{"action": "read", "url": "%s", "paths": %s}' % (url, json.dumps(paths[i:i + 200]))
                      for i in range(0, len(paths), 200)]
-            calls += ['{"action": "read", "url": "%s", "path": "%s"}' % (url, a) for a in assets]
-            res = []
-            if calls:
-                res, _ = run_claude(claude, "Make exactly these Artifact tool calls, in this order, and nothing else:\n"
-                                    + "\n".join("%d) %s" % (n + 1, c) for n, c in enumerate(calls))
-                                    + "\nThen reply with the word DONE.", len(calls) + 3, work)
-            missing, missing_assets = set(paths), set(assets)
+            res, _ = run_claude(claude, "Make exactly these Artifact tool calls, in this order, and nothing else:\n"
+                                + "\n".join("%d) %s" % (n + 1, c) for n, c in enumerate(calls))
+                                + "\nThen reply with the word DONE.", len(calls) + 3, work)
+            missing = set(paths)
             for text in res:
                 saved = parse_read_result(text)
                 for rel, size, sha in saved["files"]:
@@ -526,18 +559,39 @@ def save_artifact(claude, work, base, it, index, docs_tools):
                     store(src, stage / "files" / rel, prev_dir / "files" / rel if prev_dir else None, sha)
                     meta["files"].append({"path": rel, "size": size, "sha256": sha})
                     missing.discard(rel)
-                asset = parse_asset_saved(text)
-                if asset:
-                    path, size, sha = asset
-                    name = os.path.basename(path)
-                    aid32 = name.split(".")[0]
-                    if aid32 in missing_assets and "/artifact-files/" in path and sha256(path) == sha:
-                        store(path, stage / "assets" / name, prev_dir / "assets" / name if prev_dir else None, sha)
-                        meta["assets"].append({"name": name, "size": size, "sha256": sha})
-                        missing_assets.discard(aid32)
-            if missing or missing_assets:
-                raise RuntimeError("not downloaded: %d of %d files, %d of %d assets (e.g. %s)" % (
-                    len(missing), len(paths), len(missing_assets), len(assets), sorted(missing | missing_assets)[:3]))
+            if missing:
+                raise RuntimeError("not downloaded: %d of %d files (e.g. %s)" % (len(missing), len(paths), sorted(missing)[:3]))
+
+        # Assets never change under the same id: reuse the ones already saved, download only the rest.
+        to_get = []
+        for asset_id, asset_sha in assets:
+            o = old_assets.get(asset_id)
+            if o and o["sha256"] == asset_sha and (prev_dir / "assets" / o["name"]).is_file():
+                (stage / "assets").mkdir(parents=True, exist_ok=True)
+                os.link(prev_dir / "assets" / o["name"], stage / "assets" / o["name"])
+                meta["assets"].append(o)
+            else:
+                to_get.append((asset_id, asset_sha))
+        for k in range(0, len(to_get), ASSET_BATCH):
+            batch = dict(to_get[k:k + ASSET_BATCH])
+            calls = ['{"action": "read", "url": "%s", "path": "%s"}' % (url, a) for a in batch]
+            res, _ = run_claude(claude, "Make exactly these Artifact tool calls, in this order, and nothing else:\n"
+                                + "\n".join("%d) %s" % (n + 1, c) for n, c in enumerate(calls))
+                                + "\nThen reply with the word DONE.", len(calls) + 3, work)
+            for text in res:
+                saved = parse_asset_saved(text)
+                if not saved:
+                    continue
+                path, size, asset_sha = saved
+                name = os.path.basename(path)
+                asset_id = name.split(".")[0]
+                if batch.get(asset_id) == asset_sha and "/artifact-files/" in path and sha256(path) == asset_sha:
+                    (stage / "assets").mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, stage / "assets" / name)
+                    meta["assets"].append({"name": name, "size": size, "sha256": asset_sha})
+                    del batch[asset_id]
+            if batch:
+                raise RuntimeError("not downloaded: %d of %d assets (e.g. %s)" % (len(batch), len(to_get), sorted(batch)[:3]))
 
         docs_sha = None
         if atype == "Docs":
@@ -545,7 +599,7 @@ def save_artifact(claude, work, base, it, index, docs_tools):
             # the artifact counts as an error, and the next run tries again.
             meta["docs"], docs_sha = export_docs(claude, work, aid, docs_tools or DOCS_TOOLS, stage)
 
-        if version == prev.get("version") and docs_sha == prev.get("docs_sha") and prev_dir and prev_dir.is_dir():
+        if same_version and same_assets and docs_sha == prev.get("docs_sha"):
             prev["checked"] = CHECK_DATE
             return False
         (stage / "meta.json").write_text(json.dumps(meta, indent=1))
@@ -567,8 +621,10 @@ def needs_check(prev, listed_updated):
 
     The artifact list dates changes by day in UTC, so anything changed within a day of the last check
     is checked again. Docs text changes without a new artifact date, so Docs are checked every run."""
-    if prev.get("type") == "Docs" or not prev.get("checked"):
-        return True
+    if prev.get("inaccessible_since"):
+        return prev.get("inaccessible_checked") != CHECK_DATE  # lost access: retry once a day
+    if listed_updated is None or prev.get("type") == "Docs" or not prev.get("checked"):
+        return True  # not in the account's list, so only a check can tell whether it changed
     margin = datetime.date.fromisoformat(prev["checked"]) - datetime.timedelta(days=1)
     return listed_updated >= margin.isoformat()
 
@@ -600,6 +656,13 @@ def backup_artifacts():
         cleanup_headless_leftovers()
 
 
+def unlisted_known(items, index):
+    """Artifacts already in the backup that the account's list leaves out, checked by their saved links."""
+    listed = {it["id"] for it in items}
+    return [{"id": aid, "url": e["url"], "title": e.get("title") or aid, "owner": "known link", "updated": None}
+            for aid, e in sorted(index.items()) if aid not in listed and e.get("url")]
+
+
 def run_artifact_backup(claude, base, index, index_path, stats):
     with tempfile.TemporaryDirectory(prefix=RUN_DIR_MARK) as work:
         results, tools = run_claude(claude, 'Call the Artifact tool exactly once with {"action": "list", "scope": '
@@ -607,14 +670,23 @@ def run_artifact_backup(claude, base, index, index_path, stats):
         read_tool = next((t for t in tools if re.match(r"^mcp__.*Docs.*__read$", t)), None)
         export_tool = next((t for t in tools if re.match(r"^mcp__.*Docs.*__export$", t)), None)
         docs_tools = (read_tool, export_tool) if read_tool and export_tool else None
-        items = parse_artifact_list("\n".join(results))
+        text = "\n".join(results)
+        header = LIST_HEADER_RE.search(text)
+        items = parse_artifact_list(text)
+        if not header or len(items) < min(int(header.group(1) or 0), 50):
+            raise RuntimeError("artifact list not understood (its format may have changed): %r" % text[:300])
         stats["listed"] = len(items)
-        if not items:
-            raise RuntimeError("artifact list came back empty: %r" % ("\n".join(results)[:300]))
-        for it in items:
+        # Artifacts shared from another organization (for example by your previous Claude account) are not
+        # in the list, though their links still work. Check every artifact the backup already knows by link.
+        known = unlisted_known(items, index)
+        stats["known_links"], stats["inaccessible"] = len(known), 0
+        for it in items + known:
             prev = index.get(it["id"], {})
             if not needs_check(prev, it["updated"]):
-                stats["unchanged"] += 1
+                if prev.get("inaccessible_since"):
+                    stats["inaccessible"] += 1
+                else:
+                    stats["unchanged"] += 1
                 continue
             try:
                 if save_artifact(claude, work, base, it, index, docs_tools):
@@ -622,9 +694,23 @@ def run_artifact_backup(claude, base, index, index_path, stats):
                     log("  artifact saved: %s" % it["title"])
                 else:
                     stats["unchanged"] += 1
+                for k in ("inaccessible_since", "inaccessible_checked"):
+                    index.get(it["id"], {}).pop(k, None)
             except Exception as e:  # one broken artifact must not stop the others
-                stats["errors"] += 1
-                log("  artifact error: %s: %s" % (it["title"], e))
+                docs_refused = isinstance(e, DocsAccessDenied)
+                if docs_refused or (it in known and "artifact not found" in str(e)):
+                    stats["inaccessible"] += 1
+                    prev = index.setdefault(it["id"], {"url": it["url"], "title": it["title"]})
+                    if not prev.get("inaccessible_since"):
+                        stats["errors"] += 1  # notify once
+                        prev["inaccessible_since"] = CHECK_DATE
+                        log("  %s: %s (its last snapshot, %s, is kept; checked again daily)" % (
+                            "Docs text not readable from this account" if docs_refused else "artifact no longer accessible",
+                            it["title"], prev.get("dir")))
+                    prev["inaccessible_checked"] = CHECK_DATE
+                else:
+                    stats["errors"] += 1
+                    log("  artifact error: %s: %s" % (it["title"], e))
             index_path.write_text(json.dumps(index, indent=1, sort_keys=True))
     return stats, "ok"
 
